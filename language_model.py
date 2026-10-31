@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 from computer_control import open_application, open_website, search_google, tell_date, tell_time
 from config import get_sarvam_client
 from file_access import (delete_text_file, open_local_file, read_text_file, replace_text_in_file,
-                         update_text_file, write_text_file)
+                         rename_text_file, update_text_file, write_text_file)
 
 
 MODEL = "sarvam-105b-conversations"
@@ -141,6 +141,17 @@ TOOLS = [
                 "path": {"type": "string"}}, "required": ["path"]},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "rename_text_file",
+            "description": "Rename a specifically named text file when the user asks. The new name stays in the same folder, and an omitted extension is preserved.",
+            "parameters": {"type": "object", "properties": {
+                "path": {"type": "string", "description": "Existing file name or path."},
+                "new_name": {"type": "string", "description": "New file name without a different folder."}},
+                "required": ["path", "new_name"]},
+        },
+    },
 ]
 
 TOOL_HANDLERS = {
@@ -156,11 +167,13 @@ TOOL_HANDLERS = {
         args.get("path", ""), args.get("old_text", ""), args.get("new_text", "")),
     "update_text_file": lambda args: update_text_file(args.get("path", ""), args.get("content", "")),
     "delete_text_file": lambda args: delete_text_file(args.get("path", "")),
+    "rename_text_file": lambda args: rename_text_file(
+        args.get("path", ""), args.get("new_name", "")),
 }
 FILE_TOOLS = {"open_local_file", "read_text_file", "write_text_file", "replace_text_in_file",
-              "update_text_file", "delete_text_file"}
+              "update_text_file", "delete_text_file", "rename_text_file"}
 FILE_ACTION_WORDS = re.compile(
-    r"\b(?:open|edit|modify|change|update|rewrite|fix|improve|create|write|save|replace|read|inspect|delete|remove|overwrite|badlo|sudhar|hatao|mitao)\b",
+    r"\b(?:open|edit|modify|change|update|rewrite|fix|improve|create|write|save|replace|read|inspect|delete|remove|rename|overwrite|badlo|sudhar|hatao|mitao)\b",
     re.IGNORECASE,
 )
 
@@ -251,7 +264,7 @@ def _system_prompt(language, memories):
         "Only say you completed an action after its tool reports success. If a tool fails, explain that plainly. "
         "You may answer general questions directly, but do not pretend your built-in knowledge is current. "
         "Never run shell commands, send messages, or make purchases. "
-        "You have local file tools: NOVA can open requested documents in their default app and can read, create, update, and delete plain-text files. Do not claim you lack local or system-level file access. Use these tools when asked to interact with a local file; relative filenames are searched in the project folder and the user's Desktop, Documents, and Downloads. Only act on files the user requests. Read an existing text file before editing and prefer a unique exact text replacement so unrelated content stays untouched. If the user explicitly asks you to choose a filename and save a new file on the Desktop, choose a descriptive .txt name there; use content they requested in the current or immediately preceding turn. The Desktop folder is " + desktop + ". Never overwrite existing files. Delete a file only when the user clearly says to delete that exact named file. Use the exact path the user supplied or the current project context makes clear. "
+        "You have local file tools: NOVA can open requested documents in their default app and can read, create, update, delete, and rename plain-text files. Do not claim you lack local or system-level file access. Use these tools when asked to interact with a local file; relative filenames are searched in the project folder and the user's Desktop, Documents, and Downloads. Only act on files the user requests. Read an existing text file before editing and prefer a unique exact text replacement so unrelated content stays untouched. If the user explicitly asks you to choose a filename and save a new file on the Desktop, choose a descriptive .txt name there; use content they requested in the current or immediately preceding turn. The Desktop folder is " + desktop + ". Never overwrite existing files. Delete a file only when the user clearly says to delete that exact named file. Use the exact path the user supplied or the current project context makes clear. "
         "If the destination is unclear, ask which file they mean. Never claim a file changed unless the write tool confirms it. "
         "If the user asks for an action that is not available, say what you can do instead.\n\n"
         "The user's saved notes:\n" + profile
@@ -289,7 +302,9 @@ def generate_reply(user_text, history, language, memories, client=None, model=No
     client = client or get_sarvam_client()
     model = model or os.getenv("nova_llm_model", MODEL)
     messages = [{"role": "system", "content": _system_prompt(language, memories)}]
-    messages.extend(history[-12:])
+    # Include enough persisted context to resolve references and preferences
+    # across several recent exchanges.
+    messages.extend(history[-40:])
     messages.append({"role": "user", "content": user_text})
     recent_user_text = "\n".join(
         item.get("content", "") for item in history[-6:]
@@ -301,6 +316,7 @@ def generate_reply(user_text, history, language, memories, client=None, model=No
         and not re.match(r"\s*(?:how|what|why|explain|tell me how)\b", user_text, re.IGNORECASE)
     )
 
+    last_file_result = None
     for _ in range(MAX_TOOL_ROUNDS + 1):
         response = client.chat.completions(
             model=model,
@@ -317,6 +333,8 @@ def generate_reply(user_text, history, language, memories, client=None, model=No
         tool_calls = getattr(message, "tool_calls", None) or []
         if not tool_calls:
             reply = _message_content(message)
+            if last_file_result is not None:
+                return last_file_result
             if reply:
                 return reply
             break
@@ -337,10 +355,18 @@ def generate_reply(user_text, history, language, memories, client=None, model=No
             assistant_message["content"] = message.content
         messages.append(assistant_message)
         for call in tool_calls:
+            tool_result = _execute_tool(call, user_text, recent_user_text)
+            if call.function.name in FILE_TOOLS:
+                last_file_result = tool_result
+                if tool_result.startswith((
+                    "I couldn't", "I can access", "The requested action could not be understood:",
+                    "The action failed:",
+                )):
+                    return tool_result
             messages.append({
                 "role": "tool",
                 "tool_call_id": call.id,
-                "content": _execute_tool(call, user_text, recent_user_text),
+                "content": tool_result,
             })
 
-    return "nahh man i cant do that."
+    return last_file_result or "nahh man i cant do that."

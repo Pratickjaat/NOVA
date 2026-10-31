@@ -57,6 +57,16 @@ def _resolve_user_file(path, for_creation=False):
             relative_candidates.extend(folder / candidate for folder in _user_folders())
 
         existing = [item.resolve(strict=False) for item in relative_candidates if item.is_file()]
+        if not existing and not for_creation and not candidate.suffix:
+            # Voice requests often omit the extension even when the file is
+            # named .txt. Resolve that exact basename when the match is unique.
+            extension_matches = [
+                item.resolve(strict=False)
+                for base in relative_candidates
+                for item in (base.with_name(base.name + ".txt"), base.with_name(base.name + ".text"))
+                if item.is_file()
+            ]
+            existing = list(dict.fromkeys(extension_matches))
         if len(existing) > 1:
             paths = "; ".join(str(item) for item in existing[:5])
             raise ValueError(f"I found more than one file named {candidate.name}: {paths}. Tell me which path to use.")
@@ -164,6 +174,25 @@ def delete_text_file(path):
     shutil.copy2(target, backup)
     target.unlink()
     return f"Deleted {target}. A backup is saved as {backup}."
+
+
+def rename_text_file(path, new_name):
+    """Rename a requested text file within its current directory."""
+    source = _resolve_user_file(path)
+    if not source.is_file():
+        raise ValueError("I couldn't find that file.")
+    name = Path(str(new_name or "").strip().strip('"'))
+    if not name.name or name.name in {".", ".."} or name.is_absolute() or name.parent != Path("."):
+        raise ValueError("Give me a new filename without a different folder.")
+    if not name.suffix and source.suffix:
+        name = name.with_name(name.name + source.suffix)
+    destination = (source.parent / name.name).resolve(strict=False)
+    if destination.exists():
+        raise ValueError("A file with that name already exists. Nothing was renamed.")
+    if destination.name.lower() in SENSITIVE_NAMES or destination.suffix.lower() in SENSITIVE_SUFFIXES:
+        raise ValueError("I can't rename a file to a credential or key filename.")
+    source.rename(destination)
+    return f"Renamed {source} to {destination}."
 
 
 def open_local_file(path):

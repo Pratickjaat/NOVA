@@ -44,8 +44,10 @@ nova_llm_model=sarvam-105b-conversations
 NOVA uses Sarvam Chat Completions for open-ended conversation and natural
 language requests. Recent turns and saved notes are sent to Sarvam when NOVA
 needs a model response. Notes you explicitly ask NOVA to remember are kept
-locally in `nova_memory.json`; chat history is kept in memory for the current
-session only. The model setting is optional and defaults to
+locally in `nova_memory.json`; recent conversation context is kept in
+`nova_chat.sqlite3` (up to 200 turns) so NOVA can follow up after a restart.
+Clearing the conversation in the UI clears this local history but keeps saved
+notes. The model setting is optional and defaults to
 `sarvam-105b-conversations`.
 
 For a direct file action, name the file in one command. For example: “Create a

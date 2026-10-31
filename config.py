@@ -8,6 +8,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 LANGUAGE_FILE = BASE_DIR / "nova_language.json"
 MEMORY_FILE = BASE_DIR / "nova_memory.json"
+CHAT_DATABASE = BASE_DIR / "nova_chat.sqlite3"
 VOSK_MODEL_PATH = BASE_DIR / "models" / "vosk-model-small-en-us-0.15"
 
 _client = None
