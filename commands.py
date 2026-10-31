@@ -257,8 +257,10 @@ def _search_query(command):
     return match.group(1).strip() if match else None
 
 
-def process_command(command, recent_file=None):
-    file_response = process_file_command(command, recent_file=recent_file)
+def process_command(command, recent_file=None, default_extension=""):
+    file_response = process_file_command(
+        command, recent_file=recent_file, default_extension=default_extension
+    )
     if file_response is not None:
         return file_response
 
