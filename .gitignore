@@ -11,6 +11,9 @@ java-history/.env
 .m2/
 nova_language.json
 nova_memory.json
+nova_chat.sqlite3
+nova_chat.sqlite3-shm
+nova_chat.sqlite3-wal
 nova_input*.wav
 nova_response*.wav
 models/vosk-model-small-en-us-0.15/
