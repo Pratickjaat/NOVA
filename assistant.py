@@ -6,6 +6,7 @@ import threading
 
 from commands import normalize_command, process_command
 from config import LANGUAGE_FILE
+from chat_store import ChatStore
 from language_model import generate_reply
 from memory import PersonalMemory
 from speech import listen
@@ -25,6 +26,32 @@ LANGUAGE_COMMANDS = {
 }
 
 
+def _replacement_text_from_followup(command):
+    """Extract only content explicitly supplied after a replacement cue."""
+    command = str(command or "").strip()
+    patterns = (
+        r"^(?:replace|overwrite|rewrite)\s+(?:the\s+)?(?:whole|entire|all)\s+(?:content|contents|file)\s+(?:with|to)\s*[:=]?\s*(.+)$",
+        r"^(?:replace|overwrite|rewrite)\s+(?:the\s+)?(?:whole|entire|all)\s+(?:content|contents|file)\s+and\s+(?:just\s+)?write(?:\s*[:=]\s*|\s+)(.+)$",
+        r"^(?:write|put)\s*:\s*(.+)$",
+    )
+    for pattern in patterns:
+        match = re.match(pattern, command, re.IGNORECASE | re.DOTALL)
+        if match and match.group(1).strip():
+            return match.group(1).strip()
+    return None
+
+
+def _is_incomplete_replacement_instruction(command):
+    """Catch edit-mode directions that do not include replacement text."""
+    normalized = normalize_command(command)
+    patterns = (
+        r"^(?:replace|overwrite|rewrite|update|change)\s+(?:(?:the|all|whole|entire)\s+)*(?:content|contents|file|everything)(?:\s+and\s+(?:just\s+)?(?:write|replace|rewrite))?$",
+        r"^(?:just\s+)?write(?:\s+(?:it|the content|the whole content))?$",
+        r"^start over$",
+    )
+    return any(re.match(pattern, normalized, re.IGNORECASE) for pattern in patterns)
+
+
 class NOVA:
     def __init__(self):
         self.running = True
@@ -35,7 +62,8 @@ class NOVA:
         self.language = self.load_language()
         self.voice.set_language(self.language)
         self.memory = PersonalMemory()
-        self.chat_history = []
+        self.chat_store = ChatStore()
+        self.chat_history = self.chat_store.load()
         self.awake_mode = False
         self._interrupted_command = None
         self._interrupted_command_lock = threading.Lock()
@@ -169,23 +197,55 @@ class NOVA:
             if self.language == "hindi":
                 return "Namaste! Kaise ho?"
             return "Hey! How's it going?"
+        default_extension = self._default_file_extension()
         latest_assistant = next(
             (message.get("content", "") for message in reversed(self.chat_history)
              if message.get("role") == "assistant"),
             "",
         )
+        recent_file = self._last_file_path()
         if (isinstance(latest_assistant, str)
-                and latest_assistant.startswith("What should I change in ")
-                and self._last_file_path()
+                and latest_assistant.startswith("What should I rename ")
+                and recent_file
                 and not re.match(r"\s*(?:what|why|how|cancel|never mind|nevermind|stop)\b", command, re.IGNORECASE)):
+            return process_command(f'rename "{recent_file}" to "{command.strip()}"',
+                                   recent_file=recent_file,
+                                   default_extension=default_extension)
+        pending_edit = (
+            isinstance(latest_assistant, str)
+            and (latest_assistant.startswith("What should I change in ")
+                 or latest_assistant.startswith("What exact content should I put in "))
+            and recent_file
+        )
+        if (pending_edit
+                and not re.match(r"\s*(?:what|why|how|cancel|never mind|nevermind|stop)\b", command, re.IGNORECASE)):
+            replacement = _replacement_text_from_followup(command)
+            if replacement is not None:
+                return process_command(f"set it to {replacement}", recent_file=recent_file,
+                                       default_extension=default_extension)
+            if _is_incomplete_replacement_instruction(command):
+                return (f"What exact content should I put in {recent_file}? You can say the text itself, "
+                        "or say ‘write:’ followed by the text.")
             # Treat the user's immediate follow-up as the content they were
-            # just asked to provide (e.g. "hello world").
-            return process_command(f"set it to {command}", recent_file=self._last_file_path())
-        return process_command(command, recent_file=self._last_file_path())
+            # just asked to provide (e.g. "hello world") only when it reads
+            # like content, not a direction about the edit operation.
+            return process_command(f"set it to {command}", recent_file=recent_file,
+                                   default_extension=default_extension)
+        return process_command(command, recent_file=recent_file,
+                               default_extension=default_extension)
+
+    def _default_file_extension(self):
+        for fact in reversed(self.memory.all()):
+            match = re.search(r"default extension for new files is (\.[a-z0-9]{1,10})",
+                              fact, re.IGNORECASE)
+            if match:
+                return match.group(1).lower()
+        return ""
 
     def _last_file_path(self):
-        """Get the last path NOVA confirmed creating or changing in this chat."""
-        for message in reversed(self.chat_history):
+        """Get the latest confirmed file path, including older saved turns."""
+        history = self.chat_store.load() or self.chat_history
+        for message in reversed(history):
             if message.get("role") != "assistant":
                 continue
             response = message.get("content", "")
@@ -203,10 +263,20 @@ class NOVA:
                     path = path.rstrip(".")
                 if path:
                     return path
+            if response.startswith("Renamed ") and " to " in response:
+                path = response[len("Renamed "):].rsplit(" to ", 1)[1].rstrip(".")
+                if path:
+                    return path
         return None
 
     def handle_command(self, command, on_state=None):
         """Process a typed or recognized command through one shared route."""
+        if re.fullmatch(r"\s*(?:noah|nova)[\s.!?,]*", str(command or ""), re.IGNORECASE):
+            response = ("I'm here. What do you need?" if self.language == "english"
+                        else "Haan, bolo kya karna hai?")
+            self.speak(response, on_state)
+            self._remember_turn(command, response)
+            return response
         normalized = normalize_command(command)
         if normalized in {"sleep", "go to sleep", "standby", "stand by", "take a nap"}:
             self.awake_mode = False
@@ -230,6 +300,19 @@ class NOVA:
         if normalized in LANGUAGE_COMMANDS["english"]:
             self.switch_language("english", announce=True, on_state=on_state)
             return "English mode enabled."
+
+        extension_preference = re.search(
+            r"\b(?:from now on|going forward|for future files)\b.*?\.(txt|md|csv|json|html|css|js|py)\b|"
+            r"\.(txt|md|csv|json|html|css|js|py)\b.*?\b(?:from now on|going forward|for future files)\b",
+            command, re.IGNORECASE,
+        )
+        if extension_preference:
+            extension = "." + next(group for group in extension_preference.groups() if group).lower()
+            self.memory.remember(f"Default extension for new files is {extension}.")
+            response = f"Got it. I’ll use {extension} for new files when you don’t specify an extension."
+            self._remember_turn(command, response)
+            self.speak(response, on_state)
+            return response
 
         memory_response = self.handle_memory_request(command)
         if memory_response is not None:
@@ -314,10 +397,18 @@ class NOVA:
             {"role": "assistant", "content": assistant_text},
         ])
         self.chat_history = self.chat_history[-24:]
+        try:
+            self.chat_store.append(user_text, assistant_text)
+        except Exception as error:
+            print(f"NOVA local conversation history was not saved: {error}")
 
     def clear_chat_history(self):
         """Clear current-session context without deleting explicitly saved notes."""
         self.chat_history.clear()
+        try:
+            self.chat_store.clear()
+        except Exception as error:
+            print(f"NOVA local conversation history was not cleared: {error}")
 
     def start(self):
         print("==============================")
